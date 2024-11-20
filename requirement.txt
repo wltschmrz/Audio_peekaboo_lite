@@ -1,0 +1,6 @@
+rp --upgrade --quiet
+scikit-learn --upgrade --quiet
+transformers
+diffusers
+
+

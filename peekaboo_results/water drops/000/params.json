@@ -1,0 +1,20 @@
+{
+	"GRAVITY": 0.05,
+	"BATCH_SIZE": 1,
+	"NUM_ITER": 300,
+	"GUIDANCE_SCALE": 100,
+	"bilateral_kwargs": {
+		"kernel_size": 3,
+		"tolerance": 0.08,
+		"sigma": 5,
+		"iterations": 40
+	},
+	"representation": "fourier bilateral",
+	"label": "SimpleLabel(name=water drops)",
+	"audio_path": "extended_water_drops.wav",
+	"height": 64,
+	"width": 1024,
+	"p_name": "water drops",
+	"min_step": null,
+	"max_step": null
+}
