@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import repeat
+import numpy as np
 
 from src.audio import wav_to_fbank, TacotronSTFT, read_wav_file
 from src.utils import default_audioldm_config, get_duration, get_bit_depth, round_up_duration
@@ -31,7 +32,6 @@ class AudioLDM(nn.Module):
         pipe = AudioLDMPipeline.from_pretrained(
             checkpoint_path,
             torch_dtype=torch.float16, ##
-            safety_checker=None,
         ).to(self.device)
 
         pipe.scheduler = PNDMScheduler(
@@ -62,7 +62,7 @@ class AudioLDM(nn.Module):
         self.alphas = self.scheduler.alphas_cumprod.to(self.device)  # for convenience
         print(f'[INFO] Loaded AudioLDM model from {checkpoint_path}')
 
-
+#   text -> embedding: (2,512)
     def get_text_embeddings(self, prompts: Union[str, List[str]], num_waveforms_per_prompt=1) -> torch.Tensor:
 
         if prompts is not None and isinstance(prompts, str):
@@ -128,9 +128,8 @@ class AudioLDM(nn.Module):
 
         prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
 
-        return prompt_embeds  # dim?
+        return prompt_embeds  # (2,512)
 
-    
     def train_step(self,
                    text_embeddings: torch.Tensor,
                    pred_audio: torch.Tensor,  # B3HW
@@ -138,8 +137,10 @@ class AudioLDM(nn.Module):
                    t: Optional[int] = None):
         '이 메서드는 dream-loss gradients을 생성하는 역할.'
 
-        input_mel = torch.clamp(pred_audio[:, :1] * 9 - 9, -9, 0)
-        input_mel = input_mel.half() 
+        lower=-12.85; upper=3.59
+        input_mel = pred_audio[:, :1] - (upper - lower)
+        if input_mel.dtype != torch.float16:
+            input_mel = input_mel.to(torch.float16)
 
         if t is None:
             t = torch.randint(self.min_step, self.max_step + 1, [1], dtype=torch.long, device=self.device)
@@ -164,42 +165,58 @@ class AudioLDM(nn.Module):
         w = (1 - self.alphas[t])
         grad = w * (noise_pred - noise)
 
+        custom_loss = ((noise_pred - noise) ** 2).mean().item()  # noise와 noise_pred 간 차이 저장
+
         # grad에서 item을 생략하고 자동 미분 불가능하므로, 수동 backward 수행.
         latents.backward(gradient=grad, retain_graph=True)
-        return 0  # dummy loss value
+        return custom_loss  # dummy loss value
 
-    def encode_mels(self, mel_spectrogram: torch.Tensor) -> torch.Tensor:
+#   mel: (B,1,T,C) -> latent: (B,8,8,256)
+    def encode_mels(self, mel: torch.Tensor) -> torch.Tensor:
+        posterior = self.vae.encode(mel)  # (B,1,T,C) -> (B,8,8,256)
         
-        posterior = self.vae.encode(mel_spectrogram)  # BCHW -> (B,8,8,256)
-        latent_distribution = posterior.latent_dist
-
-        if isinstance(latent_distribution, DiagonalGaussianDistribution):
-            latents = latent_distribution.sample()
-        elif isinstance(latent_distribution, torch.Tensor):
-            latents = latent_distribution
+        encoder_posterior = posterior.latent_dist
+        if isinstance(encoder_posterior, DiagonalGaussianDistribution):
+            z = encoder_posterior.sample()
+        elif isinstance(encoder_posterior, torch.Tensor):
+            z = encoder_posterior
         else:
             raise NotImplementedError(
-                f"encoder_posterior of type '{type(latent_distribution)}' not yet implemented"
+                f"encoder_posterior of type '{type(encoder_posterior)}' not yet implemented"
             )
-        latents = latents * self.vae.config.scaling_factor
+        init_latent = z * self.vae.config.scaling_factor
 
-        if(torch.max(torch.abs(latents)) > 1e2):
-            latents = torch.clip(latents, min=-10, max=10)
-        return latents  # (B,8,8,256)
+        if(torch.max(torch.abs(init_latent)) > 1e2):
+            init_latent = torch.clip(init_latent, min=-10, max=10)
+        return init_latent  # (B,8,8,256)
 
+#   latent: (B,8,8,256) -> mel: (B,1,T,C)
     def decode_latents(self, latents):
         latents = 1 / self.vae.config.scaling_factor * latents
-        mel_spectrogram = self.vae.decode(latents).sample
-        return mel_spectrogram
+        mel = self.vae.decode(latents).sample
+        return mel
 
-    def waveform_to_mel_spectrogram(self, waveform_path, duration=10, batchsize=1):
+#   .wav -> mel: (B,1,T,C)
+    def waveform_to_mel_spectrogram(self, original_audio_file_path, duration=10, batchsize=1):
+        # vocoder_upsample_factor = np.prod(self.vocoder.config.upsample_rates) / self.vocoder.config.sampling_rate
+        # if audio_length_in_s is None:
+        #     audio_length_in_s = self.unet.config.sample_size * self.vae_scale_factor * vocoder_upsample_factor
+        # height = int(audio_length_in_s / vocoder_upsample_factor)
+        # self.original_waveform_length = int(audio_length_in_s * self.vocoder.config.sampling_rate)
+        # if height % self.vae_scale_factor != 0:
+        #     height = int(np.ceil(height / self.vae_scale_factor)) * self.vae_scale_factor
+        #     print(
+        #         f"Audio length in seconds {audio_length_in_s} is increased to {height * vocoder_upsample_factor} "
+        #         f"so that it can be handled by the model. It will be cut to {audio_length_in_s} after the "
+        #         f"denoising process.")        
         
-        assert waveform_path is not None, "You need to provide the original audio file path"
+        assert original_audio_file_path is not None, \
+"You need to provide the original audio file path"
+        assert get_bit_depth(original_audio_file_path) == 16, \
+"The bit depth of the original audio file %s must be 16"\
+ % original_audio_file_path
         
-        audio_file_duration = get_duration(waveform_path)
-
-        assert get_bit_depth(waveform_path) == 16, "The bit depth of the original audio file %s must be 16" % waveform_path
-        
+        audio_file_duration = get_duration(original_audio_file_path)
         if(duration > audio_file_duration):
             print("Warning: Duration you specified %s-seconds must equal or smaller than the audio file duration %ss" % (duration, audio_file_duration))
             duration = round_up_duration(audio_file_duration)
@@ -215,17 +232,37 @@ class AudioLDM(nn.Module):
             self.config["preprocessing"]["mel"]["mel_fmax"],
         )
 
-        mel, _, _ = wav_to_fbank(waveform_path, target_length=int(duration * 102.4), fn_STFT=fn_STFT)  # HW
-        mel = mel.unsqueeze(0).unsqueeze(0)  # 11HW
-        mel = repeat(mel, "1 ... -> b ...", b=batchsize)  # B1HW
+        # 1. 멜 스펙트로그램 변환
+        mel, _, _ = wav_to_fbank(  # (T,C)
+            original_audio_file_path, 
+            target_length=int(duration * 102.4), 
+            fn_STFT=fn_STFT
+        )
+        mel = mel.unsqueeze(0).unsqueeze(0).to(self.device)  # (1,1,T,C)
+        mel = repeat(mel, "1 ... -> b ...", b=batchsize)  # (B,1,T,C)
+        return mel  # (B,1,T,C)
 
-        return mel
+#   mel: (B,1,T,C) -> waveform: (1,s)
+    @torch.no_grad
+    def mel_spectrogram_to_waveform(self, mel):
+        # Mel: [bs, 1, t-steps, fbins]
+        if len(mel.size()) == 4:
+            mel = mel.squeeze(1)
+        mel = mel.permute(0, 2, 1)  # (B,C,T)
+        waveform = self.vocoder(mel)
+        waveform = waveform.cpu().detach().numpy()
+        return waveform  # (1,s)
 
-    def mel_spectrogram_to_waveform(self, mel_spectrogram):
-        if mel_spectrogram.dim() == 4:
-            mel_spectrogram = mel_spectrogram.squeeze(1)
 
-        waveform = self.vocoder(mel_spectrogram)
-        waveform = waveform.cpu().float()
-        return waveform
-    
+
+
+
+
+
+
+
+
+
+
+
+
