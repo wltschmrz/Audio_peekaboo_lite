@@ -5,13 +5,14 @@ import torch
 import torch.nn as nn
 from easydict import EasyDict
 from einops import repeat
+import matplotlib.pyplot as plt
+import soundfile as sf
 
 import src.audioldm as aldm
-from src.bilateralblur_learnabletextures import (BilateralProxyBlur,
+from src.bilateralblur_learnabletextures import (
                                     LearnableImageFourier,
-                                    LearnableImageFourierBilateral,
                                     LearnableImageRaster,
-                                    LearnableImageRasterBilateral)
+                                    )
 
 #Importing this module loads a stable diffusion model. Hope you have a GPU
 aldm = aldm.AudioLDM(device='cuda',
@@ -21,18 +22,13 @@ device = aldm.device
 
 #==========================================================================================================================
 
-def make_learnable_image(height, weight, num_channels, foreground=None, bilateral_kwargs=None, representation='fourier'):
+def make_learnable_image(height, weight, num_label, representation='fourier'):
     "이미지의 파라미터화 방식을 결정하여 학습 가능한 이미지를 생성."
-    bilateral_kwargs = bilateral_kwargs or {}
-    bilateral_blur = BilateralProxyBlur(foreground, **bilateral_kwargs)
-    if representation == 'fourier bilateral':
-        return LearnableImageFourierBilateral(bilateral_blur, num_channels)
-    elif representation == 'raster bilateral':
-        return LearnableImageRasterBilateral(bilateral_blur, num_channels)
-    elif representation == 'fourier':
-        return LearnableImageFourier(height, weight, num_channels)
+    mask_channel = num_label
+    if representation == 'fourier':
+        return LearnableImageFourier(height, weight, mask_channel)
     elif representation == 'raster':
-        return LearnableImageRaster(height, weight, num_channels)
+        return LearnableImageRaster(height, weight, mask_channel)
     else:
         raise ValueError(f'Invalid method: {representation}')
 
@@ -40,28 +36,51 @@ def blend_torch_images(foreground, background, alpha):
     '주어진 foreground와 background 이미지를 alpha 값에 따라 블렌딩합니다.'
     C, H, W = foreground.shape
     assert foreground.shape == background.shape, 'foreground, background shape 다름'
-    assert alpha.shape == (H, W), 'alpha가 (H, W) 크기의 행렬이 아님.'
+    assert alpha.shape == (H, W), f'alpha가 (H, W) 크기의 행렬이 아님: {alpha.shape}'
     return foreground * alpha + background * (1 - alpha)
 
-def make_image_square(image: np.ndarray, method='crop') -> np.ndarray:
+def normalize_and_clip(data, lower=-12.85, upper=3.59, to_one=True, scale=1):
     """
-    주어진 이미지를 512x512(x3) 크기의 정사각형으로 변환. 
-    method는 'crop' 또는 'scale' 중 하나를 사용할 수 있다."""
-    
-    try:
-        image = rp.as_rgb_image(image)  # 이미지가 3채널 RGB인지 확인 및 변환
-        height, width = rp.get_image_dimensions(image)
-        min_dim = min(height, width)
-    except:
-        height, width = rp.get_image_dimensions(image)
-        min_dim = min(height, width)
+    주어진 데이터를 [0, 1]로 정규화, 범위를 벗어난 값은 클리핑 처리.
+        - 평균(mean): -4.63
+        - 표준편차(std): 2.74
+        - 범위: [-12.85, 3.59] (mean +- 3*std).
+    """
+    # PyTorch Tensor일 경우
+    if isinstance(data, torch.Tensor):
+        data = torch.clamp(data, min=lower, max=upper)  # 클리핑
+    # NumPy 배열일 경우
+    elif isinstance(data, np.ndarray):
+        data = np.clip(data, lower, upper)  # 클리핑
+    else:
+        raise TypeError("Input must be a PyTorch Tensor or a NumPy ndarray.")
+    if to_one:
+        normalized_data = (data - lower) / (upper - lower)  # 정규화
+        normalized_data = normalized_data * scale
+    else:
+        normalized_data = (data - lower)
+    return normalized_data
 
-    if method == 'crop':
-        # 중앙에서 자르고 스케일링하여 정사각형 이미지 생성
-        return make_image_square(rp.crop_image(image, min_dim, min_dim, origin='center'), 'scale')
+def loss_plot(losslist1, losslist2, output_folder_path):
+    plt.figure(figsize=(10, 5))
     
-    # 'scale' 메서드일 경우 이미지 크기를 512x512로 조정
-    return rp.resize_image(image, (512, 512))
+    plt.subplot(1, 2, 1)  # 1행 2열, 첫 번째
+    plt.plot(losslist1, marker='o', markersize=4)
+    plt.title("Loss 1 (Gravity)")
+    plt.xlabel("Iteration")
+    plt.ylabel("Loss Value")
+    
+    plt.subplot(1, 2, 2)  # 1행 2열, 두 번째
+    plt.plot(losslist2, marker='s', color='orange', markersize=4)
+    plt.title("Loss 2 (Guidance)")
+    plt.xlabel("Iteration")
+    plt.ylabel("Loss Value")
+
+    plt.tight_layout()
+
+    graph_path = f"{output_folder_path}/losses_plot.png"
+    plt.savefig(graph_path, dpi=300)  # DPI 설정 가능
+    print(f"Loss plot saved at {graph_path}")
 
 #==========================================================================================================================
 
@@ -123,14 +142,13 @@ class PeekabooSegmenter(nn.Module):
                  target_length: int = 1024,  # T
                  channel: int = 1,
                  name: str = 'Untitled', 
-                 bilateral_kwargs: dict = None, 
                  representation: str = 'fourier bilateral', 
                  min_step=None, 
                  max_step=None):
         super().__init__()     
 
-        self.height = mel_channel
-        self.width = target_length
+        self.height = target_length
+        self.width = mel_channel
         self.channel = channel
         self.labels = labels
         self.name = name
@@ -138,52 +156,36 @@ class PeekabooSegmenter(nn.Module):
         self.min_step = min_step
         self.max_step = max_step
         
+        # 멜스펙트로그램 전처리 // (이미지 전처리: self.image = image  # np (512,512,3) -> np (256,256,3) & (0,1) norm)
+        mel = audio  # (B,1,T,C)=(B,1,H,W), tensr, grad
+        chw_tensor = repeat(mel[0, 0], "h w -> c h w", c=3)  # (3,H,W)
+        normalized_tensor = normalize_and_clip(chw_tensor, to_one=False)  # (3,H,W) [0,~] normalizing
 
-        mel = audio  # B1HW
-        hwc_tensor = repeat(mel[0, 0], "h w -> c h w", c=3)  # (3,H,W)
-        normalized_tensor = torch.clamp((hwc_tensor + 9) / 9, 0, 1)  # (3,H,W) [0,1] normalizing
-        
-            # # 이미지 전처리
-            # image = rp.cv_resize_image(image, (self.height, self.width))  # np (256,256,3)
-
-            # # 채널에 맞게 이미지 변환
-            # if self.channel == 3:
-            #     image = rp.as_rgb_image(image)  # 3채널로 변환 (RGB)
-
-            # image = rp.as_float_image(image)  # 값의 범위를 0과 1 사이로 변환
-            # self.image = image  # np (256,256,3) & norm
-
-        img = repeat(mel[0, 0], "h w -> h w c", c=3)  # (H,W,3)
-        img = torch.clamp((img + 9) / 9 * 255, 0, 255)  # [0,255] normalizing
-        # croped = make_image_square(normalized_tensor, square_image_method)
+        # 멜스펙트로그램 gray image화
+        mel_for_img = mel.detach().clone()
+        img = repeat(mel_for_img[0, 0], "h w -> h w c", c=3)  # (H,W,3)
+        img = normalize_and_clip(img, scale=255)  # [0,255] normalizing
         img = rp.as_numpy_array(img.to(torch.uint8))
-        mel_image = rp.as_rgb_image(rp.as_float_image(img))  # -> np (512,512,3)
+        mel_image = rp.as_rgb_image(rp.as_float_image(img))  # -> np (512,512,3)???
         self.image = mel_image
 
-        # 이미지를 Torch 텐서로 변환 (CHW 형식)
-        self.foreground = rp.as_torch_image(normalized_tensor).to(device)  # torch (3,64,1024) & norm
+        # # 이미지를 Torch 텐서로 변환 (CHW 형식)
+        # self.foreground = rp.as_torch_image(normalized_tensor).to(device)  # torch (3,64,1024) & norm
+        self.foreground = normalized_tensor
         
         # 배경은 단색으로 설정
         self.background = torch.zeros_like(self.foreground)
         
         # 학습 가능한 알파 값 생성
-        bilateral_kwargs = bilateral_kwargs or {}
         self.alphas = make_learnable_image(self.height,
                                            self.width,
-                                           num_channels=len(labels), 
-                                           foreground=self.foreground, 
+                                           num_label=len(labels), 
                                            representation=self.representation, 
-                                           bilateral_kwargs=bilateral_kwargs)
+                                           )
             
     @property
     def num_labels(self):
         return len(self.labels)
-            
-    def set_background_color(self, color):
-        r,g,b = color
-        self.background[0] = r
-        self.background[1] = g
-        self.background[2] = b
 
     def default_background(self):
         self.background[0] = 0
@@ -235,9 +237,10 @@ def display(self):
             rp.tiled_images(
                 rp.labeled_images(
                     [self.image, alphas[0], composites[0][0]],
-                    ["Input Image", "Alpha Map", "Default Background"]
+                    ["Input Image", "Alpha Map", "Default Background"],
                 ),
-                length=3  # 단일 채널은 3개의 이미지
+                length=3,  # 단일 채널은 3개의 이미지
+                transpose=False,
             ),
             label_names[0]
         )
@@ -246,20 +249,10 @@ def display(self):
         output_image = rp.labeled_image(
             rp.tiled_images(
                 rp.labeled_images(
-                    [self.image,
-                     alphas[0],
-                     composites[0][0],
-                     composites[1][0],
-                     composites[2][0]],
-                    ["Input Image",
-                     "Alpha Map",
-                     "Background #1",
-                     "Background #2",
-                     "Background #3"],
-                ),
-                length=2 + len(composites),
-            ),
-            label_names[0]
+                    [self.image, alphas[0], composites[0][0], composites[1][0], composites[2][0]],
+                    ["Input Image", "Alpha Map", "Background #1", "Background #2", "Background #3"],
+                ), length=2 + len(composites),
+            ), label_names[0]
         )
     # 이미지 출력
     rp.display_image(output_image)
@@ -271,17 +264,11 @@ def run_peekaboo(name: str,
                  label: Optional['BaseLabel'] = None,
 
                  GRAVITY=1e-1/2,
-                 NUM_ITER=300,
-                 LEARNING_RATE=1e-5, 
+                 NUM_ITER=600,
+                 LEARNING_RATE=1e-6, 
                  BATCH_SIZE=1,   
                  GUIDANCE_SCALE=100,
-                 bilateral_kwargs=dict(
-                     kernel_size=3,
-                     tolerance=0.08,
-                     sigma=5,
-                     iterations=40
-                     ),
-                 square_image_method='crop', 
+
                  representation='fourier bilateral',
                  min_step=None, 
                  max_step=None) -> PeekabooResults:
@@ -298,30 +285,17 @@ def run_peekaboo(name: str,
     """
     
     # 레이블이 없을 경우 기본 레이블 생성
-    label = label or SimpleLabel(name)  # label이 갖고 있는 embedding dim은 (2,77,768) -> (2,)
+    label = label or SimpleLabel(name)  # label이 갖고 있는 embedding dim은 (2,77,768) -> (2,512)???
 
-    # # 이미지 로드 및 전처리
-    # image_path = image if isinstance(image, str) else '<No image path given>'
-    # image = rp.load_image(image_path) if isinstance(image, str) else image  # np (500,500,3)
-    # image = rp.as_rgb_image(rp.as_float_image(make_image_square(image, square_image_method)))  # np (512,512,3)
-
-    # 오디오 로드 및 전처리
+    # 오디오 로드 및 전처리 // (이미지 로드 및 전처리  path -> (512,512,3) np)
     audio_path = audio if isinstance(audio, str) else '<No image path given>'
-    mel = aldm.waveform_to_mel_spectrogram(audio_path, duration=10, batchsize=BATCH_SIZE)  # B1HW
+    mel = aldm.waveform_to_mel_spectrogram(audio_path, duration=10, batchsize=BATCH_SIZE)  # (B,1,T,C)
 
-    hwc_tensor = repeat(mel[0, 0], "h w -> h w c", c=3)  # (H,W,3)
-    normalized_tensor = torch.clamp((hwc_tensor + 9) / 9 * 255, 0, 255)  # [0,255] normalizing
-    # croped = make_image_square(normalized_tensor, square_image_method)
-    normalized_tensor_uint8 = rp.as_numpy_array(normalized_tensor.to(torch.uint8))
-
-    mel_image = rp.as_rgb_image(rp.as_float_image(normalized_tensor_uint8))  # -> np (512,512,3)
-    
     # PeekabooSegmenter 생성
     pkboo = PeekabooSegmenter(
         mel,
         labels=[label],
         name=name,
-        bilateral_kwargs=bilateral_kwargs,
         representation=representation,
         min_step=min_step,
         max_step=max_step
@@ -337,6 +311,8 @@ def run_peekaboo(name: str,
     global iter_num
     iter_num = 0
     timelapse_frames=[]
+    losses1=[]
+    losses2=[]
     preview_interval = max(1, NUM_ITER // 10)  # 10번의 미리보기를 표시
 
     try:
@@ -350,11 +326,15 @@ def run_peekaboo(name: str,
                 pkboo.default_background()
                 composites = pkboo()
                 for label, composite in zip(pkboo.labels, composites):
-                    aldm.train_step(label.embedding, composite[None], guidance_scale=GUIDANCE_SCALE)
+                    loss2 = aldm.train_step(label.embedding, composite[None], guidance_scale=GUIDANCE_SCALE)
 
-            ((alphas.sum()) * GRAVITY).backward()
+            loss1 = (alphas.sum()) * GRAVITY
+            loss1.backward()
             optim.step()
             optim.zero_grad()
+
+            losses1.append(loss1.item())
+            losses2.append(loss2)
 
             with torch.no_grad():
                 if not _ % preview_interval: 
@@ -362,7 +342,6 @@ def run_peekaboo(name: str,
 
     except KeyboardInterrupt:
         print("Interrupted early, returning current results...")
-                
 
     results = PeekabooResults(
         #The main output
@@ -370,8 +349,8 @@ def run_peekaboo(name: str,
         
         #Keep track of hyperparameters used
         GRAVITY=GRAVITY, BATCH_SIZE=BATCH_SIZE, NUM_ITER=NUM_ITER, GUIDANCE_SCALE=GUIDANCE_SCALE,
-        bilateral_kwargs=bilateral_kwargs, representation=representation, label=label,
-        audio_image=mel_image, audio_path=audio_path, 
+        representation=representation, label=label,
+        audio_image=pkboo.image, audio_path=audio_path, 
         
         #Record some extra info
         preview_image=pkboo.display(), timelapse_frames=rp.as_numpy_array(timelapse_frames),
@@ -381,4 +360,19 @@ def run_peekaboo(name: str,
     output_folder = rp.make_folder(f'peekaboo_results/{name}')
     output_folder += f'/{len(rp.get_subfolders(output_folder)):03}'
     save_peekaboo_results(results, output_folder)
+
+    loss_plot(losses1, losses2, output_folder)
+
+    composites = pkboo()
+    lower=-12.85; upper=3.59
+    input_mel = composites - (upper - lower)
+    input_mel = input_mel[:, :1]
+    if input_mel.dtype != torch.float16:
+        input_mel = input_mel.to(torch.float16)
+    
+    wav = aldm.mel_spectrogram_to_waveform(input_mel)  # 163872,
+    wav = wav[:, :aldm.original_waveform_length]
+    wav = (wav.numpy(),)
+    sf.write(f'{output_folder}/output_sound.wav', wav, 16000, subtype='PCM_16')
+
   
