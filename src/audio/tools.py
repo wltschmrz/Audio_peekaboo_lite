@@ -82,4 +82,4 @@ def wav_to_fbank(filename, target_length=1024, fn_STFT=None):
         log_magnitudes_stft, target_length
     )
 
-    return fbank.T, log_magnitudes_stft, waveform
+    return fbank, log_magnitudes_stft, waveform
